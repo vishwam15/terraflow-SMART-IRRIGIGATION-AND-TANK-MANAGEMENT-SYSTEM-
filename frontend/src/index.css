@@ -1,0 +1,56 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400&family=Inter:wght@400;500;600;700&display=swap');
+
+@theme {
+  --color-soil-950: #0e1410;
+  --color-soil-900: #141d17;
+  --color-soil-800: #1c2820;
+  --color-soil-700: #263529;
+  --color-soil-600: #3a4d3d;
+
+  --color-water-500: #2fa8a0;
+  --color-water-400: #4fc4bb;
+  --color-water-300: #7fd9d1;
+
+  --color-growth-500: #6fcf97;
+  --color-growth-400: #8fe0ae;
+
+  --color-clay-500: #b08159;
+  --color-clay-400: #c79b74;
+
+  --color-cream-100: #f2f5f1;
+  --color-cream-200: #dfe6dd;
+  --color-cream-400: #9fb0a6;
+
+  --font-display: 'Fraunces', serif;
+  --font-body: 'Inter', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--color-cream-100);
+  color: var(--color-soil-950);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-water-500);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
