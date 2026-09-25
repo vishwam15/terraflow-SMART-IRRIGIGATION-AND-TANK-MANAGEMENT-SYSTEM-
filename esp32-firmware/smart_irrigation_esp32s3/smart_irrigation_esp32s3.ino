@@ -1,108 +1,151 @@
 /*
   TERRAFLOW SMART IRRIGATION - ESP32-S3
-  =====================================
+  ======================================
 
-  Pump 1 = TANK FILLING  -> GPIO 6
-  Pump 2 = IRRIGATION    -> GPIO 7
+  PUMP 1 = TANK-FILLING PUMP -> GPIO 6
+  PUMP 2 = IRRIGATION PUMP   -> GPIO 7
 
-  Soil moisture sensor  -> GPIO 1
-  Ultrasonic TRIG       -> GPIO 4
-  Ultrasonic ECHO       -> GPIO 5
+  SOIL MOISTURE -> GPIO 1
+  HC-SR04 TRIG  -> GPIO 4
+  HC-SR04 ECHO  -> GPIO 5 (through voltage divider)
 
   MQTT:
     Broker: broker.hivemq.com
-    Port: 1883
+    Port : 1883
 
-  Commands from WebApp/Backend through MQTT:
-    FILL_ON       = MANUAL Pump 1 filling ON
-    FILL_OFF      = Pump 1 OFF
-    PUMP_ON       = MANUAL Pump 2 irrigation ON
-    PUMP_OFF      = Pump 2 OFF
-    AUTO_MODE_ON  = Automatic irrigation ON/OFF by moisture
-    AUTO_MODE_OFF = Automatic irrigation disabled
+  MQTT COMMAND TOPIC:
+    irrigation/cmd
+
+  COMMANDS:
+    FILL_ON       -> Manual Tank-Filling Pump ON
+    FILL_OFF      -> Manual Tank-Filling Pump OFF
+
+    PUMP_ON       -> Manual Irrigation Pump ON
+    PUMP_OFF      -> Manual Irrigation Pump OFF
+
+    AUTO_MODE_ON  -> Enable Automatic Irrigation
+    AUTO_MODE_OFF -> Disable Automatic Irrigation
+
+  AUTOMATIC IRRIGATION:
+    Moisture < 30% -> Pump 2 ON
+    Moisture > 80% -> Pump 2 OFF
+    30% to 80%     -> Keep current Pump 2 state
 
   IMPORTANT:
-    - NO ECHO affects ONLY automatic Pump 1 filling.
-    - Manual FILL_ON can start Pump 1 even if ultrasonic has NO ECHO.
-    - Pump 2 does NOT depend on ultrasonic Echo.
-    - Pump 2 can be started manually or automatically.
-
-  Rules:
-    1. Pump 1 is the tank-filling pump.
-    2. Pump 2 is the irrigation pump.
-    3. Only ONE pump can run at a time.
-    4. Pump 2 can start only when soil moisture < 90%.
-    5. If soil moisture reaches 90%, Pump 2 stops automatically.
-    6. NO ECHO affects ONLY AUTOMATIC Pump 1 filling.
-    7. Manual FILL_ON can start Pump 1 even with NO ECHO.
-    8. Pump 2 does NOT depend on ultrasonic Echo.
-    9. Pump 2 can be started manually or automatically.
-   10. On startup/MQTT reconnect, both pumps are OFF.
+    - Pump 1 is ALWAYS manual. There is NO automatic tank filling.
+    - Ultrasonic NO ECHO does NOT stop or block Pump 1 manual control.
+    - Ultrasonic has NO effect on Pump 2.
+    - Pump 2 works in both manual and automatic modes.
+    - Only one pump can run at a time.
+    - Soil moisture is published every 1 second.
 */
 
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// ================= WIFI =================
+// ============================================================
+// WIFI
+// ============================================================
 const char* WIFI_SSID = "V";
 const char* WIFI_PASSWORD = "12345678";
 
-// ================= MQTT =================
+// ============================================================
+// MQTT
+// ============================================================
 const char* MQTT_BROKER = "broker.hivemq.com";
 const int MQTT_PORT = 1883;
 const char* MQTT_CLIENT_ID = "Terraflow_ESP32S3";
 
-// MQTT topics
-const char* TOPIC_COMMAND = "irrigation/cmd";
-const char* TOPIC_MOISTURE = "irrigation/moisture";
-const char* TOPIC_TANK_LEVEL = "irrigation/tank_level";
-const char* TOPIC_PUMP1_STATUS = "irrigation/pump1_status";
-const char* TOPIC_PUMP2_STATUS = "irrigation/pump2_status";
+const char* TOPIC_COMMAND       = "irrigation/cmd";
+const char* TOPIC_MOISTURE      = "irrigation/moisture";
+const char* TOPIC_TANK_LEVEL    = "irrigation/tank_level";
+const char* TOPIC_PUMP1_STATUS  = "irrigation/pump1_status";
+const char* TOPIC_PUMP2_STATUS  = "irrigation/pump2_status";
 
-// ================= PINS =================
-// Soil moisture
+// ============================================================
+// PINS
+// ============================================================
 #define SOIL_PIN 1
 
-// Ultrasonic
 #define TRIG_PIN 4
 #define ECHO_PIN 5
 
-// Pump 1 = TANK FILLING
+// Pump 1 = Tank filling
 #define PUMP1_PIN 6
 
-// Pump 2 = IRRIGATION
+// Pump 2 = Irrigation
 #define PUMP2_PIN 7
 
 // Relay is active LOW
-#define RELAY_ON LOW
+#define RELAY_ON  LOW
 #define RELAY_OFF HIGH
 
-// ================= MOISTURE =================
+// ============================================================
+// SOIL MOISTURE CALIBRATION
+// ============================================================
+// Higher ADC value = drier soil
+// Lower ADC value  = wetter soil
 #define SOIL_DRY 3000
 #define SOIL_WET 1200
 
-// Irrigation allowed only below 90%
-#define IRRIGATION_THRESHOLD 90
+// Automatic irrigation thresholds
+#define IRRIGATION_START_THRESHOLD 30
+#define IRRIGATION_STOP_THRESHOLD 80
 
-// ================= TANK =================
+// ============================================================
+// TANK
+// ============================================================
 #define TANK_HEIGHT_CM 8.0
 
-// ================= OBJECTS =================
+// ============================================================
+// OBJECTS
+// ============================================================
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// Pump states
+// ============================================================
+// STATE
+// ============================================================
 bool pump1Running = false;
 bool pump2Running = false;
 
-// Automatic irrigation mode.
-// When enabled:
-//   moisture < 90%  -> Pump 2 ON
-//   moisture >= 90% -> Pump 2 OFF
 bool autoIrrigation = false;
 
-unsigned long lastSensorPublish = 0;
-const unsigned long SENSOR_INTERVAL = 3000;
+// Latest soil moisture value
+int currentMoisture = 0;
+
+// ============================================================
+// TIMERS
+// ============================================================
+unsigned long lastMoisturePublish = 0;
+const unsigned long MOISTURE_INTERVAL = 1000; // 1 second
+
+unsigned long lastTankPublish = 0;
+const unsigned long TANK_INTERVAL = 3000; // tank level every 3 seconds
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+void connectWiFi();
+void connectMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+
+int readMoisture();
+float readTankLevel();
+
+void updateAutomaticIrrigation();
+
+void startFillingPumpManual();
+void stopFillingPump();
+
+void startIrrigationPumpManual();
+void stopIrrigationPump();
+
+void allPumpsOFF();
+
+void publishMoisture();
+void publishTankLevel();
+void publishPumpStatus();
 
 // ============================================================
 // SETUP
@@ -113,28 +156,41 @@ void setup()
   delay(1000);
 
   Serial.println();
-  Serial.println("====================================");
-  Serial.println("TERRAFLOW SMART IRRIGATION");
-  Serial.println("ESP32-S3");
-  Serial.println("====================================");
+  Serial.println("========================================");
+  Serial.println("     TERRAFLOW SMART IRRIGATION");
+  Serial.println("           ESP32-S3 SYSTEM");
+  Serial.println("========================================");
 
+  // Sensor pins
   pinMode(SOIL_PIN, INPUT);
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
+  // Relay pins
   pinMode(PUMP1_PIN, OUTPUT);
   pinMode(PUMP2_PIN, OUTPUT);
 
-  // SAFETY: both pumps OFF at startup
-  allPumpsOFF();
+  // Safety: both pumps OFF
+  digitalWrite(PUMP1_PIN, RELAY_OFF);
+  digitalWrite(PUMP2_PIN, RELAY_OFF);
+
+  pump1Running = false;
+  pump2Running = false;
 
   digitalWrite(TRIG_PIN, LOW);
 
+  Serial.println("Both pumps OFF at startup.");
+
+  // WiFi
   connectWiFi();
 
+  // MQTT
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
+
+  // Initial moisture reading
+  currentMoisture = readMoisture();
 
   Serial.println("System ready.");
 }
@@ -144,11 +200,13 @@ void setup()
 // ============================================================
 void loop()
 {
+  // Keep WiFi connected
   if (WiFi.status() != WL_CONNECTED)
   {
     connectWiFi();
   }
 
+  // Keep MQTT connected
   if (!mqttClient.connected())
   {
     connectMQTT();
@@ -156,20 +214,35 @@ void loop()
 
   mqttClient.loop();
 
-  // Automatic irrigation is independent of the ultrasonic sensor.
-  // Ultrasonic NO ECHO affects only automatic Pump 1 filling.
-  if (autoIrrigation)
+  // ----------------------------------------------------------
+  // SOIL MOISTURE EVERY 1 SECOND
+  // ----------------------------------------------------------
+  if (millis() - lastMoisturePublish >= MOISTURE_INTERVAL)
   {
-    checkAutomaticIrrigation();
+    lastMoisturePublish = millis();
+
+    currentMoisture = readMoisture();
+
+    // Always publish moisture every second
+    publishMoisture();
+
+    // Automatic irrigation uses this same reading
+    if (autoIrrigation)
+    {
+      updateAutomaticIrrigation();
+    }
   }
 
-  if (millis() - lastSensorPublish >= SENSOR_INTERVAL)
+  // ----------------------------------------------------------
+  // TANK LEVEL
+  // ----------------------------------------------------------
+  if (millis() - lastTankPublish >= TANK_INTERVAL)
   {
-    publishSensorData();
-    lastSensorPublish = millis();
+    lastTankPublish = millis();
+    publishTankLevel();
   }
 
-  delay(50);
+  delay(10);
 }
 
 // ============================================================
@@ -177,7 +250,12 @@ void loop()
 // ============================================================
 void connectWiFi()
 {
-  Serial.print("Connecting WiFi");
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    return;
+  }
+
+  Serial.print("Connecting to WiFi");
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -190,54 +268,63 @@ void connectWiFi()
     attempts++;
   }
 
+  Serial.println();
+
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println();
     Serial.println("WiFi connected.");
-    Serial.print("IP: ");
+    Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
   }
   else
   {
-    Serial.println();
     Serial.println("WiFi connection failed.");
   }
 }
 
 // ============================================================
-// MQTT
+// MQTT CONNECTION
 // ============================================================
 void connectMQTT()
 {
   while (!mqttClient.connected())
   {
-    Serial.print("Connecting MQTT...");
+    Serial.print("Connecting to MQTT...");
 
-    if (mqttClient.connect(MQTT_CLIENT_ID))
+    // Use a unique client ID if the same ID is already connected
+    String clientId = MQTT_CLIENT_ID;
+    clientId += "_";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    if (mqttClient.connect(clientId.c_str()))
     {
-      Serial.println("connected!");
+      Serial.println("connected.");
 
       mqttClient.subscribe(TOPIC_COMMAND);
 
-      Serial.print("Subscribed: ");
+      Serial.print("Subscribed to: ");
       Serial.println(TOPIC_COMMAND);
 
-      // SAFETY: both pumps OFF after reconnect.
-      // Automatic irrigation is also disabled until WebApp enables it again.
-      autoIrrigation = false;
+      // Safety after reconnect
       allPumpsOFF();
+
+      // Automatic mode must be enabled again by frontend
+      autoIrrigation = false;
+
+      Serial.println("Automatic irrigation disabled after MQTT reconnect.");
     }
     else
     {
-      Serial.print("MQTT failed, state=");
+      Serial.print("MQTT connection failed. State = ");
       Serial.println(mqttClient.state());
+
       delay(3000);
     }
   }
 }
 
 // ============================================================
-// MQTT COMMAND CALLBACK
+// MQTT CALLBACK
 // ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
@@ -250,78 +337,69 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 
   command.trim();
 
-  Serial.print("MQTT command received: ");
+  Serial.println();
+  Serial.println("========== MQTT COMMAND ==========");
+  Serial.print("Topic   : ");
+  Serial.println(topic);
+  Serial.print("Command : ");
   Serial.println(command);
 
-  // ----------------------------------------------------------
-  // PUMP 1 - MANUAL TANK FILLING
-  // ----------------------------------------------------------
+  // ==========================================================
+  // MANUAL TANK-FILLING PUMP
+  // ==========================================================
   if (command == "FILL_ON")
   {
-    // MANUAL command.
-    // NO ECHO does NOT block manual filling.
     startFillingPumpManual();
   }
-
   else if (command == "FILL_OFF")
   {
     stopFillingPump();
   }
 
-  // ----------------------------------------------------------
-  // PUMP 2 - MANUAL IRRIGATION
-  // ----------------------------------------------------------
+  // ==========================================================
+  // MANUAL IRRIGATION PUMP
+  // ==========================================================
   else if (command == "PUMP_ON")
   {
-    // MANUAL irrigation.
-    // Ultrasonic Echo is NOT checked here.
     startIrrigationPumpManual();
   }
-
   else if (command == "PUMP_OFF")
   {
     stopIrrigationPump();
   }
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // AUTOMATIC IRRIGATION
-  // ----------------------------------------------------------
-  else if (command == "AUTO_MODE_ON")
+  // ==========================================================
+  else if (command == "AUTO_MODE_ON" || command == "AUTO_ON")
   {
     autoIrrigation = true;
 
-    Serial.println("AUTOMATIC IRRIGATION ENABLED.");
+    Serial.println("AUTOMATIC IRRIGATION = ON");
 
-    // Immediately evaluate moisture.
-    checkAutomaticIrrigation();
+    // Immediately evaluate the current moisture.
+    updateAutomaticIrrigation();
   }
-
-  else if (command == "AUTO_MODE_OFF")
+  else if (command == "AUTO_MODE_OFF" || command == "AUTO_OFF")
   {
     autoIrrigation = false;
 
-    Serial.println("AUTOMATIC IRRIGATION DISABLED.");
+    Serial.println("AUTOMATIC IRRIGATION = OFF");
 
-    // Stop Pump 2 when automatic mode is disabled.
+    // Turning automatic mode OFF stops Pump 2.
     stopIrrigationPump();
   }
-
   else
   {
     Serial.println("Unknown MQTT command.");
   }
+
+  Serial.println("==================================");
 }
 
 // ============================================================
-// SOIL MOISTURE
+// READ SOIL MOISTURE
 // ============================================================
-// Converts the raw analog reading to percentage.
-// Calibration:
-//   SOIL_DRY = 3000 -> 0%
-//   SOIL_WET = 1200 -> 100%
-//
-// Higher ADC value = drier soil.
-// Lower ADC value = wetter soil.
 int readMoisture()
 {
   int rawValue = analogRead(SOIL_PIN);
@@ -336,7 +414,7 @@ int readMoisture()
 
   moisture = constrain(moisture, 0, 100);
 
-  Serial.print("Soil raw ADC: ");
+  Serial.print("Soil ADC: ");
   Serial.print(rawValue);
   Serial.print(" | Moisture: ");
   Serial.print(moisture);
@@ -346,178 +424,164 @@ int readMoisture()
 }
 
 // ============================================================
-// PUMP 1 - TANK FILLING
+// AUTOMATIC IRRIGATION
 // ============================================================
-
-// MANUAL Pump 1 start.
-// NO ECHO does NOT block this command.
-void startFillingPumpManual()
+// Automatic rules:
+//
+// moisture < 30%
+//      -> Pump 2 ON
+//
+// moisture > 80%
+//      -> Pump 2 OFF
+//
+// 30% to 80%
+//      -> Keep current Pump 2 state
+//
+// Ultrasonic is NOT used here.
+// ============================================================
+void updateAutomaticIrrigation()
 {
-  // HARD MUTUAL EXCLUSION:
-  // Pump 2 must be OFF before Pump 1 starts.
-  digitalWrite(PUMP2_PIN, RELAY_OFF);
-  pump2Running = false;
+  int moisture = currentMoisture;
 
-  digitalWrite(PUMP1_PIN, RELAY_ON);
-  pump1Running = true;
-
-  Serial.println("PUMP 1 ON - MANUAL TANK FILLING.");
-  Serial.println("Ultrasonic Echo is NOT required for manual filling.");
-  Serial.println("Pump 2 forced OFF.");
-
-  publishPumpStatus();
-}
-
-
-// AUTOMATIC Pump 1 start.
-// This is the ONLY Pump 1 path that requires a valid Echo.
-void startFillingPumpAutomatic()
-{
-  float tankLevel = readTankLevel();
-
-  // NO ECHO = automatic filling blocked.
-  if (tankLevel < 0)
+  // ----------------------------------------------------------
+  // SOIL IS TOO DRY
+  // ----------------------------------------------------------
+  if (moisture < IRRIGATION_START_THRESHOLD)
   {
-    digitalWrite(PUMP1_PIN, RELAY_OFF);
-    pump1Running = false;
-
-    Serial.println("AUTO FILL BLOCKED: NO ECHO.");
-    Serial.println("Pump 1 remains OFF.");
-
-    publishPumpStatus();
-    return;
-  }
-
-  // HARD MUTUAL EXCLUSION.
-  digitalWrite(PUMP2_PIN, RELAY_OFF);
-  pump2Running = false;
-
-  digitalWrite(PUMP1_PIN, RELAY_ON);
-  pump1Running = true;
-
-  Serial.print("PUMP 1 ON - AUTOMATIC TANK FILLING. Level: ");
-  Serial.print(tankLevel);
-  Serial.println(" cm");
-
-  Serial.println("Pump 2 forced OFF.");
-
-  publishPumpStatus();
-}
-
-// ============================================================
-// STOP PUMP 1
-// ============================================================
-void stopFillingPump()
-{
-  digitalWrite(PUMP1_PIN, RELAY_OFF);
-  pump1Running = false;
-
-  Serial.println("PUMP 1 OFF - TANK FILLING STOPPED.");
-
-  publishPumpStatus();
-}
-
-// ============================================================
-// PUMP 2 - IRRIGATION
-// ============================================================
-
-// MANUAL Pump 2 start.
-// This does NOT depend on ultrasonic Echo.
-void startIrrigationPumpManual()
-{
-  int moisture = readMoisture();
-
-  Serial.print("Manual irrigation request. Moisture: ");
-  Serial.print(moisture);
-  Serial.println("%");
-
-  // Irrigation is allowed only below 90%.
-  if (moisture >= IRRIGATION_THRESHOLD)
-  {
-    digitalWrite(PUMP2_PIN, RELAY_OFF);
-    pump2Running = false;
-
-    Serial.println("MANUAL IRRIGATION BLOCKED.");
-    Serial.println("Soil moisture is 90% or higher.");
-
-    publishPumpStatus();
-    return;
-  }
-
-  // HARD MUTUAL EXCLUSION:
-  // Pump 1 must be OFF before Pump 2 starts.
-  digitalWrite(PUMP1_PIN, RELAY_OFF);
-  pump1Running = false;
-
-  digitalWrite(PUMP2_PIN, RELAY_ON);
-  pump2Running = true;
-
-  Serial.print("PUMP 2 ON - MANUAL IRRIGATION. Moisture: ");
-  Serial.print(moisture);
-  Serial.println("%");
-
-  Serial.println("Ultrasonic Echo is irrelevant to Pump 2.");
-  Serial.println("Pump 1 forced OFF.");
-
-  publishPumpStatus();
-}
-
-
-// AUTOMATIC Pump 2 control.
-// Ultrasonic Echo is NOT used here.
-void checkAutomaticIrrigation()
-{
-  int moisture = readMoisture();
-
-  if (moisture < IRRIGATION_THRESHOLD)
-  {
-    // If Pump 1 is running, do not allow Pump 2 to start.
-    // Mutual exclusion is preserved.
     if (!pump2Running)
     {
-      // Turn Pump 1 OFF first.
+      // Mutual exclusion:
+      // Pump 1 MUST be OFF before Pump 2 starts.
       digitalWrite(PUMP1_PIN, RELAY_OFF);
       pump1Running = false;
 
       digitalWrite(PUMP2_PIN, RELAY_ON);
       pump2Running = true;
 
-      Serial.print("PUMP 2 ON - AUTOMATIC IRRIGATION. Moisture: ");
+      Serial.print("AUTO: Pump 2 ON. Moisture = ");
       Serial.print(moisture);
-      Serial.println("%");
+      Serial.println("% (< 30%).");
 
       publishPumpStatus();
     }
+
+    return;
   }
-  else
+
+  // ----------------------------------------------------------
+  // SOIL IS WET ENOUGH
+  // ----------------------------------------------------------
+  if (moisture > IRRIGATION_STOP_THRESHOLD)
   {
     if (pump2Running)
     {
-      Serial.print("Moisture reached ");
+      Serial.print("AUTO: Pump 2 OFF. Moisture = ");
       Serial.print(moisture);
-      Serial.println("% - automatic irrigation OFF.");
+      Serial.println("% (> 80%).");
 
       stopIrrigationPump();
     }
+
+    return;
   }
+
+  // ----------------------------------------------------------
+  // BETWEEN 30% AND 80%
+  // ----------------------------------------------------------
+  Serial.print("AUTO: Moisture = ");
+  Serial.print(moisture);
+  Serial.println("% -> keeping current Pump 2 state.");
 }
 
+// ============================================================
+// MANUAL PUMP 1 - TANK FILLING
+// ============================================================
+// IMPORTANT:
+// There is NO ultrasonic check here.
+//
+// Therefore:
+// FILL_ON -> Pump 1 starts even when ultrasonic says NO ECHO.
+//
+// Pump 1 has NO automatic start logic.
+// ============================================================
+void startFillingPumpManual()
+{
+  // Mutual exclusion:
+  // Pump 2 MUST be OFF before Pump 1 starts.
+  digitalWrite(PUMP2_PIN, RELAY_OFF);
+  pump2Running = false;
+
+  digitalWrite(PUMP1_PIN, RELAY_ON);
+  pump1Running = true;
+
+  Serial.println("MANUAL: Pump 1 ON - tank filling.");
+  Serial.println("Ultrasonic Echo is NOT required.");
+  Serial.println("Pump 2 forced OFF.");
+
+  publishPumpStatus();
+}
 
 // ============================================================
-// STOP PUMP 2
+// MANUAL PUMP 1 OFF
+// ============================================================
+void stopFillingPump()
+{
+  digitalWrite(PUMP1_PIN, RELAY_OFF);
+  pump1Running = false;
+
+  Serial.println("MANUAL: Pump 1 OFF - tank filling stopped.");
+
+  publishPumpStatus();
+}
+
+// ============================================================
+// MANUAL PUMP 2 - IRRIGATION
+// ============================================================
+// Manual irrigation ignores:
+//   - ultrasonic
+//   - 30% start threshold
+//
+// PUMP_ON from frontend starts Pump 2.
+// ============================================================
+void startIrrigationPumpManual()
+{
+  // Mutual exclusion:
+  // Pump 1 MUST be OFF before Pump 2 starts.
+  digitalWrite(PUMP1_PIN, RELAY_OFF);
+  pump1Running = false;
+
+  digitalWrite(PUMP2_PIN, RELAY_ON);
+  pump2Running = true;
+
+  Serial.println("MANUAL: Pump 2 ON - irrigation.");
+  Serial.println("Ultrasonic Echo does NOT affect Pump 2.");
+  Serial.println("Pump 1 forced OFF.");
+
+  publishPumpStatus();
+}
+
+// ============================================================
+// MANUAL / GENERAL PUMP 2 OFF
 // ============================================================
 void stopIrrigationPump()
 {
   digitalWrite(PUMP2_PIN, RELAY_OFF);
   pump2Running = false;
 
-  Serial.println("PUMP 2 OFF - IRRIGATION STOPPED.");
+  Serial.println("Pump 2 OFF - irrigation stopped.");
 
   publishPumpStatus();
 }
 
 // ============================================================
-// ULTRASONIC - TANK WATER HEIGHT
+// ULTRASONIC TANK LEVEL
+// ============================================================
+// Used ONLY for tank-level monitoring.
+//
+// It does NOT control Pump 1.
+// It does NOT control Pump 2.
+//
+// NO ECHO simply publishes -1.
 // ============================================================
 float readTankLevel()
 {
@@ -535,34 +599,34 @@ float readTankLevel()
     30000
   );
 
-  // NO ECHO
   if (duration == 0)
   {
     Serial.println("Ultrasonic: NO ECHO.");
-    return -1;
+    return -1.0;
   }
 
   float distance = duration * 0.0343 / 2.0;
 
-  // Tank water height
   float waterLevel = TANK_HEIGHT_CM - distance;
 
-  if (waterLevel < 0 || waterLevel > TANK_HEIGHT_CM)
+  if (waterLevel < 0.0 || waterLevel > TANK_HEIGHT_CM)
   {
     Serial.println("Ultrasonic: INVALID LEVEL.");
-    return -1;
+    return -1.0;
   }
 
   return waterLevel;
 }
 
 // ============================================================
-// PUBLISH SENSOR DATA
+// PUBLISH SOIL MOISTURE
 // ============================================================
-void publishSensorData()
+void publishMoisture()
 {
-  // ---------- Moisture ----------
-  int moisture = readMoisture();
+  if (!mqttClient.connected())
+  {
+    return;
+  }
 
   char moistureBuffer[10];
 
@@ -570,30 +634,49 @@ void publishSensorData()
     moistureBuffer,
     sizeof(moistureBuffer),
     "%d",
-    moisture
+    currentMoisture
   );
 
-  mqttClient.publish(
+  bool result = mqttClient.publish(
     TOPIC_MOISTURE,
     moistureBuffer
   );
 
-  // ---------- Tank ----------
-  float tankLevel = readTankLevel();
-
-  if (tankLevel < 0)
+  if (result)
   {
-    mqttClient.publish(
-      TOPIC_TANK_LEVEL,
-      "-1"
-    );
-
-    Serial.println("Tank level: NO ECHO.");
+    Serial.print("MQTT moisture sent: ");
+    Serial.print(currentMoisture);
+    Serial.println("%");
   }
   else
   {
-    char tankBuffer[10];
+    Serial.println("MQTT moisture publish failed.");
+  }
+}
 
+// ============================================================
+// PUBLISH TANK LEVEL
+// ============================================================
+void publishTankLevel()
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+
+  float tankLevel = readTankLevel();
+
+  char tankBuffer[16];
+
+  if (tankLevel < 0)
+  {
+    strcpy(tankBuffer, "-1");
+    mqttClient.publish(TOPIC_TANK_LEVEL, tankBuffer);
+
+    Serial.println("MQTT tank level: -1 (NO ECHO)");
+  }
+  else
+  {
     snprintf(
       tankBuffer,
       sizeof(tankBuffer),
@@ -606,14 +689,10 @@ void publishSensorData()
       tankBuffer
     );
 
-    Serial.print("Tank level: ");
+    Serial.print("MQTT tank level sent: ");
     Serial.print(tankLevel);
     Serial.println(" cm");
   }
-
-  Serial.print("Soil moisture: ");
-  Serial.print(moisture);
-  Serial.println("%");
 }
 
 // ============================================================
@@ -622,7 +701,9 @@ void publishSensorData()
 void publishPumpStatus()
 {
   if (!mqttClient.connected())
+  {
     return;
+  }
 
   mqttClient.publish(
     TOPIC_PUMP1_STATUS,
@@ -636,7 +717,7 @@ void publishPumpStatus()
 }
 
 // ============================================================
-// ALL PUMPS OFF
+// SAFETY - BOTH PUMPS OFF
 // ============================================================
 void allPumpsOFF()
 {
